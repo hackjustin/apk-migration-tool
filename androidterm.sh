@@ -1,8 +1,12 @@
 #!/bin/bash
 #
-# androidterm.sh — interactive terminal session for pulling and pushing
-# APKs to/from a connected Android device via adb. One device/profile
-# selection per session; pull and push both live in the same main menu.
+# androidterm.sh — interactive terminal session for migrating APKs
+# to/from connected Android devices and the local filesystem via adb.
+# The flagship flow is "Migrate APKs (guided)": pick a source, a
+# destination, multi-select apks, and run the whole batch in one pass —
+# device-to-device, device-to-filesystem, or filesystem-to-device.
+# Manual single-package pull/push still exist underneath but are
+# currently hidden from the main menu (temporary — see MAIN_MENU_ROWS).
 # Styled after old green-phosphor terminal computers.
 #
 # Usage: ./androidterm.sh
@@ -32,6 +36,8 @@ CURRENT_DEVICE_LABEL=""
 DEVICE_SERIALS=()
 DEVICE_LABELS=()
 
+MIGRATE_STAGE_DIR=""
+
 TARGET_USER=""
 TARGET_USER_LABEL=""
 PROFILE_IDS=()
@@ -50,6 +56,7 @@ INSTALLED_FOR_PROFILE_CACHE=""
 # ---------------------------------------------------------------------------
 cleanup() {
     tput cnorm 2>/dev/null
+    [ -n "$MIGRATE_STAGE_DIR" ] && rm -rf "$MIGRATE_STAGE_DIR" 2>/dev/null
     printf '%s' "$C_RESET"
 }
 trap cleanup EXIT
@@ -80,7 +87,7 @@ fail() { printf '%s[FAIL]%s\n' "$C_DIM" "$C_RESET"; }
 banner() {
     local width=68
     local title="ANDROID TERMLINK"
-    local subtitle="rev 3.0 — pull / push unit"
+    local subtitle="rev 4.0 — guided apk migration"
     local pad_t=$(( (width - ${#title}) / 2 ))
     local pad_t2=$(( width - pad_t - ${#title} ))
     local pad_s=$(( (width - ${#subtitle}) / 2 ))
@@ -111,6 +118,7 @@ menu_select() {
     [ "$count" -eq 0 ] && return 1
     lines=$count
     [ -n "$header" ] && lines=$((lines + 1))
+    lines=$((lines + 1))  # footer hint line, always drawn — keep in sync with _mi_draw
 
     _mi_draw() {
         local j
@@ -125,6 +133,7 @@ menu_select() {
                 printf '   %s%s%s\n' "$C_GREEN" "${_mi_items[$j]}" "$C_RESET"
             fi
         done
+        tput el; printf '%s[ up/down or j/k: move   enter: select   esc/q: cancel ]%s\n' "$C_DIM" "$C_RESET"
     }
 
     tput civis
@@ -260,6 +269,149 @@ paginated_picker() {
 }
 
 # ---------------------------------------------------------------------------
+# multi-select pickers — used by the migration wizard, which lets a user
+# grab a batch of apks in one pass instead of one pull/push at a time.
+# ---------------------------------------------------------------------------
+
+# paginated_picker_multi HEADER ARRAYNAME RESULTARRAYNAME
+# Same fallback picker as paginated_picker, but space/tab toggles a mark on
+# the current line instead of selecting immediately. Enter confirms every
+# marked item (in ARRAYNAME's original order); with nothing marked, Enter
+# confirms just the highlighted line, so a single pick still works in one
+# keystroke.
+paginated_picker_multi() {
+    local header="$1"
+    local -n _pmm_all="$2"
+    local -n _pmm_result="$3"
+    local filter="" sel=0 offset=0 key rest i
+    local page_size=$(( TERM_LINES - 9 ))
+    [ "$page_size" -lt 5 ] && page_size=5
+    local -a filtered=()
+    local -A marked=()
+
+    _pmm_filter() {
+        filtered=()
+        if [ -z "$filter" ]; then
+            filtered=("${_pmm_all[@]}")
+        else
+            for i in "${_pmm_all[@]}"; do
+                [[ "$i" == *"$filter"* ]] && filtered+=("$i")
+            done
+        fi
+        [ "$sel" -ge "${#filtered[@]}" ] && sel=0
+        offset=0
+    }
+
+    _pmm_draw() {
+        clear
+        banner
+        printf '\n%s%s%s\n' "$C_BGREEN" "$header" "$C_RESET"
+        printf '%sfilter:%s %s%s_%s   %s%d marked%s\n\n' \
+            "$C_DIM" "$C_RESET" "$C_GREEN" "$filter" "$C_RESET" "$C_DIM" "${#marked[@]}" "$C_RESET"
+        for ((i=offset; i<${#filtered[@]} && i<offset+page_size; i++)); do
+            local mark=' '
+            [ -n "${marked[${filtered[$i]}]+x}" ] && mark='x'
+            if [ "$i" -eq "$sel" ]; then
+                printf '%s%s > [%s] %s%s\n' "$C_REV" "$C_BGREEN" "$mark" "${filtered[$i]}" "$C_RESET"
+            else
+                printf '   %s[%s] %s%s\n' "$C_GREEN" "$mark" "${filtered[$i]}" "$C_RESET"
+            fi
+        done
+        printf '\n%s[ %d / %d ]  arrows: move   space/tab: mark   type: filter   backspace: delete   enter: confirm   esc: cancel%s\n' \
+            "$C_DIM" "$((${#filtered[@]} > 0 ? sel + 1 : 0))" "${#filtered[@]}" "$C_RESET"
+    }
+
+    _pmm_filter
+    tput civis
+    _pmm_draw
+    while true; do
+        if ! IFS= read -rsn1 key; then
+            printf '\n%sInput closed — exiting.%s\n' "$C_DIM" "$C_RESET"
+            exit 1
+        fi
+        if [ "$key" = $'\x1b' ]; then
+            IFS= read -rsn2 -t 0.05 rest
+            key+="$rest"
+        fi
+        case "$key" in
+            $'\x1b[A')
+                [ "${#filtered[@]}" -gt 0 ] && sel=$(( (sel - 1 + ${#filtered[@]}) % ${#filtered[@]} ))
+                ;;
+            $'\x1b[B')
+                [ "${#filtered[@]}" -gt 0 ] && sel=$(( (sel + 1) % ${#filtered[@]} ))
+                ;;
+            ' '|$'\t')
+                if [ "${#filtered[@]}" -gt 0 ]; then
+                    if [ -n "${marked[${filtered[$sel]}]+x}" ]; then
+                        unset "marked[${filtered[$sel]}]"
+                    else
+                        marked["${filtered[$sel]}"]=1
+                    fi
+                fi
+                ;;
+            $'\x7f'|$'\x08')
+                filter="${filter%?}"
+                _pmm_filter
+                ;;
+            "")
+                if [ "${#marked[@]}" -gt 0 ]; then
+                    _pmm_result=()
+                    for i in "${_pmm_all[@]}"; do
+                        [ -n "${marked[$i]+x}" ] && _pmm_result+=("$i")
+                    done
+                    tput cnorm
+                    unset -f _pmm_filter _pmm_draw
+                    return 0
+                elif [ "${#filtered[@]}" -gt 0 ]; then
+                    _pmm_result=("${filtered[$sel]}")
+                    tput cnorm
+                    unset -f _pmm_filter _pmm_draw
+                    return 0
+                fi
+                ;;
+            $'\x1b')
+                tput cnorm
+                unset -f _pmm_filter _pmm_draw
+                return 1
+                ;;
+            *)
+                [ -n "$key" ] && { filter+="$key"; _pmm_filter; }
+                ;;
+        esac
+        [ "$sel" -lt "$offset" ] && offset=$sel
+        [ "$sel" -ge $((offset + page_size)) ] && offset=$(( sel - page_size + 1 ))
+        _pmm_draw
+    done
+}
+
+# pick_multi HEADER ARRAYNAME RESULTARRAYNAME
+# Uses fzf --multi when available (tab marks a line, enter confirms all
+# marked — or just the highlighted one if none were marked), otherwise
+# falls back to paginated_picker_multi. RESULTARRAYNAME is set to the
+# chosen items; returns 1 on an empty source list or a cancelled pick.
+pick_multi() {
+    local header="$1" arrname="$2"
+    local -n _pm_arr="$arrname"
+    local -n _pm_result="$3"
+    _pm_result=()
+    [ "${#_pm_arr[@]}" -eq 0 ] && return 1
+    if [ "$DEP_FZF_FOUND" -eq 1 ]; then
+        local out
+        out=$(printf '%s\n' "${_pm_arr[@]}" | fzf --multi --prompt="MIGRATE> " --height=90% \
+            --color=bg+:-1,fg+:2,bg:-1,fg:2,hl:2,hl+:2,pointer:2,marker:2,border:2,prompt:2,info:2 \
+            --header="$header  (tab: mark multiple — enter: confirm — esc: cancel)")
+        [ -z "$out" ] && return 1
+        mapfile -t _pm_result <<< "$out"
+        return 0
+    else
+        local -a picked=()
+        paginated_picker_multi "$header" "$arrname" picked || return 1
+        _pm_result=("${picked[@]}")
+        return 0
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # dependencies
 #
 # adb is required for everything and is checked before the UI even boots.
@@ -319,8 +471,10 @@ deps_screen() {
     printf '   %sbenefit: reads version info out of local APKs, so the push menu can show\n' "$C_DIM"
     printf '   NEW / UPGRADE / DOWNGRADE / up-to-date at a glance before you commit.\n'
     printf '   without it: push still works, version comparisons are just skipped.\n'
-    printf '   acquire via: Android SDK build-tools (Android Studio SDK Manager, or e.g.\n'
-    printf '   pacman -S android-sdk-build-tools / apt install android-sdk-build-tools).%s\n' "$C_RESET"
+    printf '   acquire via: Debian/Ubuntu: apt install aapt.  Arch: AUR package\n'
+    printf '   android-sdk-build-tools (needs an AUR helper, e.g. yay -S ...).\n'
+    printf '   Fedora/RHEL/openSUSE: no standalone repo package — use Android Studio'"'"'s\n'
+    printf '   SDK Manager, or the command-line tools'"'"' sdkmanager "build-tools;<ver>".%s\n' "$C_RESET"
 }
 
 # ---------------------------------------------------------------------------
@@ -345,7 +499,15 @@ refresh_devices() {
 
 # Picks a device: auto-picks if exactly one, prompts with an arrow menu if
 # several, reports and returns 1 if none. Sets CURRENT_DEVICE(_LABEL).
+# Shown before an *implicit* multi-device pick (boot, or the first pull/push
+# of a session) — an explicit "Change device" from the Device & profile menu
+# skips it, since the user's intent is already clear there.
+DEVICE_PICK_NOTE='This pick becomes your default working device. Change it anytime via "Device & profile" — or use "Migrate APKs (guided)" to choose source and destination devices independently.'
+
+# select_device [NOTE] — NOTE, if given, is printed above the picker but
+# only when there is actually a choice to make (2+ devices).
 select_device() {
+    local note="${1:-}"
     refresh_devices
     local n=${#DEVICE_SERIALS[@]}
     if [ "$n" -eq 0 ]; then
@@ -357,12 +519,47 @@ select_device() {
         printf '\n%sOne device found — using %s%s\n' "$C_GREEN" "$CURRENT_DEVICE_LABEL" "$C_RESET"
         return 0
     else
+        [ -n "$note" ] && printf '\n%s%s%s\n' "$C_DIM" "$note" "$C_RESET"
         printf '\n%s%d devices detected — select one:%s\n\n' "$C_GREEN" "$n" "$C_RESET"
         local idx
         if menu_select "" DEVICE_LABELS idx; then
             CURRENT_DEVICE="${DEVICE_SERIALS[$idx]}"
             CURRENT_DEVICE_LABEL="${DEVICE_LABELS[$idx]}"
             printf '\n%sUsing device: %s%s\n' "$C_GREEN" "$CURRENT_DEVICE_LABEL" "$C_RESET"
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+# pick_device_for HEADER OUT_SERIAL_VAR OUT_LABEL_VAR
+# Same auto-pick/menu logic as select_device, but reports into caller-named
+# variables instead of the global CURRENT_DEVICE. Used by the migration
+# wizard, which juggles a source device and a destination device that may
+# both be connected at once and must not stomp on each other (or on
+# whatever device is "current" elsewhere in the app).
+pick_device_for() {
+    local header="$1"
+    local -n _pdf_serial="$2"
+    local -n _pdf_label="$3"
+    refresh_devices
+    local n=${#DEVICE_SERIALS[@]}
+    if [ "$n" -eq 0 ]; then
+        printf '\n%sNo devices detected. Plug in a device (USB debugging enabled) and retry.%s\n' "$C_GREEN" "$C_RESET"
+        return 1
+    elif [ "$n" -eq 1 ]; then
+        _pdf_serial="${DEVICE_SERIALS[0]}"
+        _pdf_label="${DEVICE_LABELS[0]}"
+        printf '\n%sOne device found — using %s%s\n' "$C_GREEN" "$_pdf_label" "$C_RESET"
+        return 0
+    else
+        printf '\n%s%s%s\n\n' "$C_GREEN" "$header" "$C_RESET"
+        local idx
+        if menu_select "" DEVICE_LABELS idx; then
+            _pdf_serial="${DEVICE_SERIALS[$idx]}"
+            _pdf_label="${DEVICE_LABELS[$idx]}"
+            printf '\n%sUsing device: %s%s\n' "$C_GREEN" "$_pdf_label" "$C_RESET"
             return 0
         else
             return 1
@@ -404,7 +601,7 @@ require_device() {
     fi
     if [ -z "$CURRENT_DEVICE" ]; then
         printf '\n%sScanning for devices...%s\n' "$C_GREEN" "$C_RESET"
-        select_device
+        select_device "$DEVICE_PICK_NOTE"
     fi
     [ -n "$CURRENT_DEVICE" ]
 }
@@ -446,6 +643,31 @@ select_profile() {
             return 1
         fi
     fi
+}
+
+# pick_profile_for SERIAL OUT_ID_VAR OUT_LABEL_VAR
+# Runs the normal select_profile flow against an arbitrary device serial
+# (refresh_profiles reads CURRENT_DEVICE, so this swaps it in, reuses
+# select_profile as-is, then restores whatever device/profile was
+# "current" before the call). Used by the migration wizard to pick a
+# destination profile without disturbing the app's own current
+# device/profile selection.
+pick_profile_for() {
+    local serial="$1"
+    local -n _ppf_id="$2"
+    local -n _ppf_label="$3"
+    local saved_device="$CURRENT_DEVICE" saved_user="$TARGET_USER" saved_label="$TARGET_USER_LABEL"
+    CURRENT_DEVICE="$serial"
+    TARGET_USER=""
+    TARGET_USER_LABEL=""
+    local rc=0
+    select_profile || rc=1
+    _ppf_id="$TARGET_USER"
+    _ppf_label="$TARGET_USER_LABEL"
+    CURRENT_DEVICE="$saved_device"
+    TARGET_USER="$saved_user"
+    TARGET_USER_LABEL="$saved_label"
+    return "$rc"
 }
 
 require_profile() {
@@ -493,11 +715,21 @@ device_profile_menu() {
 # ---------------------------------------------------------------------------
 # pull
 # ---------------------------------------------------------------------------
-get_packages() {
-    local flag=""
-    [ "$PKG_SCOPE" = "user" ] && flag="-3"
-    adb -s "$CURRENT_DEVICE" shell pm list packages $flag 2>/dev/null \
-        | sed 's/^package://' | tr -d '\r' | sort
+get_packages() { get_packages_on "$CURRENT_DEVICE" "$PKG_SCOPE"; }
+
+# get_packages_on SERIAL SCOPE [USER] — same as get_packages but for an
+# arbitrary device serial and scope, so callers (e.g. the migration wizard)
+# aren't tied to the globally-selected CURRENT_DEVICE/PKG_SCOPE. USER, if
+# given, scopes the listing to that profile id (pm list packages --user);
+# omitted, it lists whatever the adb shell's own default user sees, same as
+# before this parameter existed.
+get_packages_on() {
+    local serial="$1" scope="$2" user="${3:-}" flag=""
+    [ "$scope" = "user" ] && flag="-3"
+    local -a cmd=(adb -s "$serial" shell pm list packages)
+    [ -n "$flag" ] && cmd+=("$flag")
+    [ -n "$user" ] && cmd+=(--user "$user")
+    "${cmd[@]}" 2>/dev/null | sed 's/^package://' | tr -d '\r' | sort
 }
 
 toggle_scope() {
@@ -549,17 +781,17 @@ select_and_pull() {
     fi
     [ -z "$chosen" ] && return
     clear; banner
-    pull_package "$chosen"
+    pull_package "$CURRENT_DEVICE" "$chosen" "$APPS_DIR/$chosen"
     pause
 }
 
-# pull_one REMOTE_PATH LOCAL_DEST
+# pull_one SERIAL REMOTE_PATH LOCAL_DEST
 # Runs `adb pull` but swallows its raw (uncolored, verbose) status line —
 # on success we print our own short, dim, indented confirmation instead;
 # on failure we surface adb's actual output so errors stay diagnosable.
 pull_one() {
-    local remote="$1" dest="$2" out status
-    out=$(adb -s "$CURRENT_DEVICE" pull "$remote" "$dest" 2>&1)
+    local serial="$1" remote="$2" dest="$3" out status
+    out=$(adb -s "$serial" pull "$remote" "$dest" 2>&1)
     status=$?
     if [ "$status" -eq 0 ]; then
         printf '     %s↳ pulled %s%s\n' "$C_DIMGREEN" "$(basename "$remote")" "$C_RESET"
@@ -569,14 +801,23 @@ pull_one() {
     return "$status"
 }
 
+# pull_package SERIAL PKG DEST_DIR [USER] — pulls PKG off the device at
+# SERIAL into DEST_DIR (created if needed). SERIAL/DEST_DIR are explicit
+# rather than always CURRENT_DEVICE/APPS_DIR so the migration wizard can
+# pull from whichever device the user picked as the source, into whichever
+# directory the user picked as the destination. USER, if given, scopes
+# `pm path` to that profile (same default-user behavior as before if
+# omitted).
 pull_package() {
-    local pkg="$1"
-    local dest="$APPS_DIR/$pkg"
+    local serial="$1" pkg="$2" dest="$3" user="${4:-}"
     mkdir -p "$dest"
 
     printf '\n%sLocating package: %s%s\n' "$C_GREEN" "$pkg" "$C_RESET"
+    local -a path_cmd=(adb -s "$serial" shell pm path)
+    [ -n "$user" ] && path_cmd+=(--user "$user")
+    path_cmd+=("$pkg")
     local paths
-    paths=$(adb -s "$CURRENT_DEVICE" shell pm path "$pkg" 2>/dev/null | sed 's/^package://' | tr -d '\r')
+    paths=$("${path_cmd[@]}" 2>/dev/null | sed 's/^package://' | tr -d '\r')
 
     if [ -z "$paths" ]; then
         printf '%sPackage "%s" not found on device.%s\n' "$C_GREEN" "$pkg" "$C_RESET"
@@ -588,13 +829,13 @@ pull_package() {
 
     if [ "$count" -eq 1 ]; then
         printf '%sSingle APK detected, pulling...%s\n' "$C_GREEN" "$C_RESET"
-        pull_one "$paths" "$dest/$pkg.apk"
+        pull_one "$serial" "$paths" "$dest/$pkg.apk"
     else
         printf '%sSplit APKs detected (%s files), pulling...%s\n' "$C_GREEN" "$count" "$C_RESET"
         local apk
         while IFS= read -r apk; do
             [ -z "$apk" ] && continue
-            pull_one "$apk" "$dest/"
+            pull_one "$serial" "$apk" "$dest/"
         done <<< "$paths"
     fi
 
@@ -691,17 +932,24 @@ colorize_status() {
 PUSH_PKG_NAMES=()
 PUSH_MENU_LABELS=()
 
-build_push_menu() {
-    local -a pkgs
+# list_local_packages — package names under APPS_DIR that have at least one
+# .apk file, i.e. the local library the push menu (and the migration
+# wizard's "local filesystem" source) both draw from.
+list_local_packages() {
     local d pkg
-    pkgs=()
     for d in "$APPS_DIR"/*/; do
         [ -d "$d" ] || continue
         pkg="${d%/}"; pkg="${pkg##*/}"
         local -a apks=("$d"*.apk)
         [ -e "${apks[0]}" ] || continue
-        pkgs+=("$pkg")
+        printf '%s\n' "$pkg"
     done
+}
+
+build_push_menu() {
+    local -a pkgs
+    local pkg
+    mapfile -t pkgs < <(list_local_packages)
     PUSH_PKG_NAMES=()
     PUSH_MENU_LABELS=()
     [ "${#pkgs[@]}" -eq 0 ] && return 1
@@ -787,13 +1035,257 @@ push_confirm_and_install() {
 }
 
 # ---------------------------------------------------------------------------
+# migrate — guided, "ez mode" wizard for moving a batch of apks in one pass.
+# Source and destination are each either a connected device or the local
+# filesystem, covering all four combinations: device->device (staged
+# through a temp dir on this machine, since adb can't talk device-to-
+# device directly), device->local, local->device, local->local. The user
+# picks source, destination, then any number of apks in one multi-select,
+# confirms once, and the whole batch runs unattended.
+# ---------------------------------------------------------------------------
+
+# migrate_install SERIAL USER APKDIR [EXTRA_INSTALL_FLAGS...]
+# Installs every .apk under APKDIR to USER on SERIAL. Unlike
+# push_confirm_and_install this is non-interactive (no downgrade prompt) —
+# it's meant to run unattended as part of a batch migration.
+migrate_install() {
+    local serial="$1" user="$2" apkdir="$3"
+    shift 3
+    local -a extra_flags=("$@")
+    local -a apks=("$apkdir"/*.apk)
+    if [ ! -e "${apks[0]}" ]; then
+        printf '     %s↳ FAILED: no apk files found in %s%s\n' "$C_DIM" "$apkdir" "$C_RESET"
+        return 1
+    fi
+    local install_out
+    if [ "${#apks[@]}" -eq 1 ]; then
+        install_out=$(adb -s "$serial" install -r "${extra_flags[@]}" --user "$user" "${apks[0]}" 2>&1)
+    else
+        install_out=$(adb -s "$serial" install-multiple -r "${extra_flags[@]}" --user "$user" "${apks[@]}" 2>&1)
+    fi
+    if [[ "$install_out" == *Success* ]]; then
+        printf '     %s↳ installed%s\n' "$C_DIMGREEN" "$C_RESET"
+        return 0
+    else
+        printf '     %s↳ FAILED: %s%s\n' "$C_DIM" "$install_out" "$C_RESET"
+        return 1
+    fi
+}
+
+# migrate_copy_local PKG DEST_ROOT — copies PKG's apk(s) from the local
+# library (APPS_DIR/PKG) into DEST_ROOT/PKG, for local-filesystem ->
+# local-filesystem migrations (e.g. exporting a batch to another drive).
+migrate_copy_local() {
+    local pkg="$1" destroot="$2"
+    local srcdir="$APPS_DIR/$pkg" destdir="$destroot/$pkg"
+    local -a apks=("$srcdir"/*.apk)
+    if [ ! -e "${apks[0]}" ]; then
+        printf '     %s↳ FAILED: no apk files found in %s%s\n' "$C_DIM" "$srcdir" "$C_RESET"
+        return 1
+    fi
+    mkdir -p "$destdir"
+    if [ "$(cd "$destdir" 2>/dev/null && pwd -P)" = "$(cd "$srcdir" 2>/dev/null && pwd -P)" ]; then
+        printf '     %s↳ already at destination, skipping%s\n' "$C_DIM" "$C_RESET"
+        return 0
+    fi
+    if cp -a "${apks[@]}" "$destdir/" 2>/dev/null; then
+        printf '     %s↳ copied to %s%s\n' "$C_DIMGREEN" "$destdir" "$C_RESET"
+        return 0
+    else
+        printf '     %s↳ FAILED to copy to %s%s\n' "$C_DIM" "$destdir" "$C_RESET"
+        return 1
+    fi
+}
+
+migrate_wizard() {
+    # _mw_header cleans itself up on every return path (explicit or falling
+    # off the end) via this RETURN trap, same idea as menu_select/
+    # paginated_picker unsetting their own nested draw functions — just
+    # centralized instead of repeated at each return.
+    trap 'unset -f _mw_header 2>/dev/null' RETURN
+
+    clear; banner
+    printf '\n%sAPK MIGRATION WIZARD%s\n' "$C_BGREEN" "$C_RESET"
+    printf '%sguided flow — pick a source, a destination, the apks you want, and go.%s\n' "$C_DIM" "$C_RESET"
+    printf '%sesc/q backs out one step at a time, all the way to the main menu.%s\n' "$C_DIM" "$C_RESET"
+
+    local -a kind_opts=("Connected Android device" "Local filesystem")
+    local kidx
+
+    # src_desc/dst_desc are the one-line "what did I already pick" summaries
+    # _mw_header prints; each stays empty (and is skipped) until that side
+    # is actually settled.
+    local src_desc="" dst_desc=""
+    _mw_header() {
+        banner
+        [ -n "$src_desc" ] && printf '\n%sSOURCE:%s %s\n' "$C_DIM" "$C_RESET" "$src_desc"
+        [ -n "$dst_desc" ] && printf '%sDESTINATION:%s %s\n' "$C_DIM" "$C_RESET" "$dst_desc"
+    }
+
+    printf '\n'
+    if ! menu_select "MIGRATE FROM (source):" kind_opts kidx; then return; fi
+    local src_kind; [ "$kidx" -eq 0 ] && src_kind=device || src_kind=local
+
+    local src_serial="" src_label="" src_user="" src_user_label=""
+    if [ "$src_kind" = device ]; then
+        clear; _mw_header
+        printf '\n%sSCANNING FOR SOURCE DEVICE...%s\n' "$C_DIM" "$C_RESET"
+        if ! pick_device_for "select source device:" src_serial src_label; then
+            pause; return
+        fi
+        printf '\n%sSCANNING FOR PROFILES ON SOURCE...%s\n' "$C_DIM" "$C_RESET"
+        if pick_profile_for "$src_serial" src_user src_user_label; then
+            src_desc="$src_label  [$src_user_label]"
+        else
+            printf '\n%sCould not determine a source profile — continuing without profile scoping.%s\n' "$C_DIM" "$C_RESET"
+            src_user=""; src_user_label=""
+            src_desc="$src_label"
+        fi
+    else
+        src_desc="$APPS_DIR (local)"
+    fi
+
+    clear; _mw_header
+    printf '\n'
+    if ! menu_select "MIGRATE TO (destination):" kind_opts kidx; then return; fi
+    local dst_kind; [ "$kidx" -eq 0 ] && dst_kind=device || dst_kind=local
+
+    local dst_serial="" dst_label="" dst_user="" dst_user_label="" dst_path=""
+    if [ "$dst_kind" = device ]; then
+        clear; _mw_header
+        printf '\n%sSCANNING FOR DESTINATION DEVICE...%s\n' "$C_DIM" "$C_RESET"
+        if ! pick_device_for "select destination device:" dst_serial dst_label; then
+            pause; return
+        fi
+        printf '\n%sSCANNING FOR PROFILES ON DESTINATION...%s\n' "$C_DIM" "$C_RESET"
+        if ! pick_profile_for "$dst_serial" dst_user dst_user_label; then
+            printf '\n%sCould not determine a destination profile.%s\n' "$C_GREEN" "$C_RESET"
+            pause; return
+        fi
+        dst_desc="$dst_label  [$dst_user_label]"
+
+        # Same device AND same profile as the source is a true no-op —
+        # pull each apk just to reinstall it right back onto itself.
+        # Same device with a *different* profile is a legitimate move
+        # (migrating apps between profiles on one phone), so that case
+        # stays silent.
+        if [ "$src_kind" = device ] && [ "$dst_serial" = "$src_serial" ] && [ -n "$dst_user" ] && [ "$dst_user" = "$src_user" ]; then
+            printf '\n%sSource and destination are the same device AND the same profile (%s).%s\n' "$C_DIM" "$dst_user_label" "$C_RESET"
+            printf '%sEach apk would just be pulled and reinstalled right back onto itself.%s\n' "$C_DIM" "$C_RESET"
+            if ! confirm_yes_no "Continue anyway?"; then
+                printf '\n%sCancelled.%s\n' "$C_DIM" "$C_RESET"
+                pause; return
+            fi
+        fi
+    else
+        clear; _mw_header
+        printf '\n%sDestination directory%s (default: %s — type q to cancel):\n' "$C_DIM" "$C_RESET" "$APPS_DIR"
+        read -e -r -p "> " dst_path
+        if [ "$dst_path" = q ] || [ "$dst_path" = Q ]; then
+            printf '\n%sCancelled.%s\n' "$C_DIM" "$C_RESET"
+            pause; return
+        fi
+        [ -z "$dst_path" ] && dst_path="$APPS_DIR"
+        mkdir -p "$dst_path" 2>/dev/null
+        if [ ! -d "$dst_path" ]; then
+            printf '\n%sCould not create/use directory: %s%s\n' "$C_GREEN" "$dst_path" "$C_RESET"
+            pause; return
+        fi
+        dst_desc="$dst_path (local)"
+    fi
+
+    local -a pool=()
+    clear; _mw_header
+    if [ "$src_kind" = device ]; then
+        printf '\n%sFetching package list (scope: %s)...%s\n' "$C_DIM" "$PKG_SCOPE" "$C_RESET"
+        mapfile -t pool < <(get_packages_on "$src_serial" "$PKG_SCOPE" "$src_user")
+    else
+        mapfile -t pool < <(list_local_packages)
+    fi
+    if [ "${#pool[@]}" -eq 0 ]; then
+        printf '\n%sNothing found to migrate from this source.%s\n' "$C_GREEN" "$C_RESET"
+        pause; return
+    fi
+
+    local -a chosen=()
+    pick_multi "SELECT APKS TO MIGRATE" pool chosen
+    if [ "${#chosen[@]}" -eq 0 ]; then
+        return
+    fi
+
+    clear; banner
+    printf '\n%sMIGRATION PLAN%s\n' "$C_BGREEN" "$C_RESET"
+    printf '%sFROM:%s %s\n' "$C_DIM" "$C_RESET" "$src_desc"
+    printf '%sTO:%s   %s\n' "$C_DIM" "$C_RESET" "$dst_desc"
+    printf '%sAPKS (%d):%s\n' "$C_DIM" "${#chosen[@]}" "$C_RESET"
+    local p
+    for p in "${chosen[@]}"; do printf '  - %s\n' "$p"; done
+    printf '\n'
+    if ! confirm_yes_no "Run migration now?"; then
+        printf '\n%sCancelled.%s\n' "$C_DIM" "$C_RESET"
+        pause; return
+    fi
+
+    local stage=""
+    if [ "$src_kind" = device ] && [ "$dst_kind" = device ]; then
+        stage=$(mktemp -d "${TMPDIR:-/tmp}/androidterm-migrate.XXXXXX")
+        MIGRATE_STAGE_DIR="$stage"
+    fi
+
+    printf '\n'
+    local ok_count=0 fail_count=0 pkg
+    for pkg in "${chosen[@]}"; do
+        printf '%s— %s —%s\n' "$C_BGREEN" "$pkg" "$C_RESET"
+        case "$src_kind:$dst_kind" in
+            device:local)
+                if pull_package "$src_serial" "$pkg" "$dst_path/$pkg" "$src_user"; then
+                    ok_count=$((ok_count+1))
+                else
+                    fail_count=$((fail_count+1))
+                fi
+                ;;
+            device:device)
+                if pull_package "$src_serial" "$pkg" "$stage/$pkg" "$src_user" && migrate_install "$dst_serial" "$dst_user" "$stage/$pkg"; then
+                    ok_count=$((ok_count+1))
+                else
+                    fail_count=$((fail_count+1))
+                fi
+                ;;
+            local:device)
+                if migrate_install "$dst_serial" "$dst_user" "$APPS_DIR/$pkg"; then
+                    ok_count=$((ok_count+1))
+                else
+                    fail_count=$((fail_count+1))
+                fi
+                ;;
+            local:local)
+                if migrate_copy_local "$pkg" "$dst_path"; then
+                    ok_count=$((ok_count+1))
+                else
+                    fail_count=$((fail_count+1))
+                fi
+                ;;
+        esac
+        printf '\n'
+    done
+
+    if [ -n "$stage" ]; then
+        rm -rf "$stage"
+        MIGRATE_STAGE_DIR=""
+    fi
+
+    printf '%sMIGRATION COMPLETE:%s %d succeeded, %d failed.\n' "$C_BGREEN" "$C_RESET" "$ok_count" "$fail_count"
+    pause
+}
+
+# ---------------------------------------------------------------------------
 # boot sequence + main menu
 # ---------------------------------------------------------------------------
 boot_sequence() {
     clear
     banner
     printf '\n'
-    type_out "  ANDROID PACKAGE PULL/PUSH TERMINAL — REV 3.0" 0.008
+    type_out "  ANDROID PACKAGE PULL/PUSH TERMINAL — REV 4.0" 0.008
     sleep 0.15
     printf '\n'
 
@@ -802,45 +1294,56 @@ boot_sequence() {
     sleep 0.1
 
     printf '\n%sSCANNING FOR DEVICES...%s\n' "$C_DIM" "$C_RESET"
-    if select_device; then
+    if select_device "$DEVICE_PICK_NOTE"; then
         printf '\n%sSCANNING FOR PROFILES...%s\n' "$C_DIM" "$C_RESET"
         select_profile
     fi
     sleep 0.2
 }
 
-MAIN_MENU_ITEMS=(
-    "Device & profile"
-    "List installed programs"
-    "Pull a program"
-    "Push a program"
-    "Toggle package scope (currently: user)"
-    "System upgrades"
-    "Exit"
+# Main menu rows are "label|handler-function" — menu_select's index maps
+# straight to a function call, so hiding an item is just commenting out its
+# row here (the handler function itself is untouched and still fully
+# callable/working). List/Pull/Push are hidden for now at the user's
+# request — this is a temporary UI change, not a functionality removal;
+# uncomment the three rows below to bring them back.
+main_menu_show_upgrades() { deps_screen; pause; }
+main_menu_exit() { clear; printf '%sTERMLINK SESSION CLOSED.%s\n' "$C_GREEN" "$C_RESET"; exit 0; }
+
+MAIN_MENU_ROWS=(
+    "Device & profile|device_profile_menu"
+    #"List installed programs|list_installed"
+    #"Pull a program|select_and_pull"
+    #"Push a program|push_menu"
+    "Migrate APKs (guided)|migrate_wizard"
+    "__TOGGLE_SCOPE__|toggle_scope"
+    "System upgrades|main_menu_show_upgrades"
+    "Exit|main_menu_exit"
 )
 
 main_menu() {
-    local idx
+    local idx row label action
+    local -a labels actions
     while true; do
-        MAIN_MENU_ITEMS[4]="Toggle package scope (currently: $PKG_SCOPE)"
+        labels=(); actions=()
+        for row in "${MAIN_MENU_ROWS[@]}"; do
+            label="${row%%|*}"
+            action="${row#*|}"
+            [ "$label" = "__TOGGLE_SCOPE__" ] && label="Toggle package scope (currently: $PKG_SCOPE)"
+            labels+=("$label")
+            actions+=("$action")
+        done
         clear
         banner
         printf '\n%sDEVICE:%s  %s\n' "$C_DIM" "$C_RESET" "${CURRENT_DEVICE_LABEL:-none selected}"
         printf '%sPROFILE:%s %s\n' "$C_DIM" "$C_RESET" "${TARGET_USER_LABEL:-none selected}"
         printf '%s%s%s\n' "$C_DIM" "$(deps_summary_line)" "$C_RESET"
         printf '\n'
-        if ! menu_select "MAIN MENU" MAIN_MENU_ITEMS idx; then
-            idx=6
+        if menu_select "MAIN MENU" labels idx; then
+            "${actions[$idx]}"
+        else
+            main_menu_exit
         fi
-        case "$idx" in
-            0) device_profile_menu ;;
-            1) list_installed ;;
-            2) select_and_pull ;;
-            3) push_menu ;;
-            4) toggle_scope ;;
-            5) deps_screen; pause ;;
-            6) clear; printf '%sTERMLINK SESSION CLOSED.%s\n' "$C_GREEN" "$C_RESET"; exit 0 ;;
-        esac
     done
 }
 
